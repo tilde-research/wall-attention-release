@@ -3,6 +3,7 @@ reproduce the training/prefill forward at the same position."""
 
 import pytest
 import torch
+from conftest import make_log_gates
 
 from fla.ops.utils.constant import RCP_LN2
 from fla.ops.utils.cumsum import chunk_global_cumsum
@@ -53,7 +54,7 @@ def test_decode_matches_training_forward(dtype, B, T, H, HQ, K, V, C):
     q = torch.randn(B, T, HQ, K, device=device, dtype=dtype)
     k = torch.randn(B, T, H, K, device=device, dtype=dtype)
     v = torch.randn(B, T, H, V, device=device, dtype=dtype)
-    g = torch.randn(B, T, HQ, K, device=device, dtype=dtype) * 0.02
+    g = make_log_gates(B, T, HQ, K, device=device)
 
     o_ref = wall_attn(q, k, v, g, scale=scale)
     P = chunk_global_cumsum(g, scale=RCP_LN2)
@@ -75,7 +76,7 @@ def test_decode_matches_training_forward_long():
     q = torch.randn(B, T, HQ, K, device=device, dtype=dtype)
     k = torch.randn(B, T, H, K, device=device, dtype=dtype)
     v = torch.randn(B, T, H, V, device=device, dtype=dtype)
-    g = torch.randn(B, T, HQ, K, device=device, dtype=dtype) * 0.02
+    g = make_log_gates(B, T, HQ, K, device=device)
 
     o_ref = wall_attn(q, k, v, g, scale=scale)
     P = chunk_global_cumsum(g, scale=RCP_LN2)
@@ -97,7 +98,7 @@ def test_decode_with_scalar_gate():
     q = torch.randn(B, T, HQ, K, device=device, dtype=dtype)
     k = torch.randn(B, T, H, K, device=device, dtype=dtype)
     v = torch.randn(B, T, H, V, device=device, dtype=dtype)
-    g = torch.randn(B, T, HQ, K, device=device, dtype=dtype) * 0.02
+    g = make_log_gates(B, T, HQ, K, device=device)
     g_scalar = torch.randn(B, T, HQ, device=device, dtype=dtype) * 0.05
 
     o_ref = wall_attn(q, k, v, g, scale=scale, g_scalar=g_scalar)
@@ -126,7 +127,7 @@ def test_decode_streaming_matches_full_forward(dtype):
     q = torch.randn(B, T, HQ, K, device=device, dtype=dtype)
     k = torch.randn(B, T, H, K, device=device, dtype=dtype)
     v = torch.randn(B, T, H, V, device=device, dtype=dtype)
-    g = torch.randn(B, T, HQ, K, device=device, dtype=dtype) * 0.02
+    g = make_log_gates(B, T, HQ, K, device=device)
 
     o_ref = wall_attn(q, k, v, g, scale=scale)
     P = chunk_global_cumsum(g, scale=RCP_LN2)
@@ -179,7 +180,7 @@ def test_decode_cache_layout_shapes():
     B, T, H, HQ, K = 2, 200, 2, 8, 32
     device = "cuda"
     k = torch.randn(B, T, H, K, device=device, dtype=torch.bfloat16)
-    g = torch.randn(B, T, HQ, K, device=device, dtype=torch.bfloat16) * 0.02
+    g = make_log_gates(B, T, HQ, K, device=device)
     P = chunk_global_cumsum(g, scale=RCP_LN2)
     for C in (32, 64, 128):
         k_tilde, r_cache = build_wall_kv_cache(k, P, chunk_size=C)

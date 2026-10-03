@@ -4,7 +4,19 @@
 import torch
 
 from fla.ops.utils.constant import RCP_LN2
-from fla.ops.utils.cumsum import chunk_global_cumsum
+
+
+def _prefix(g: torch.Tensor, cu_seqlens: torch.Tensor | None) -> torch.Tensor:
+    """Differentiable FP32 prefixes, reset at each packed sequence boundary."""
+    if cu_seqlens is None:
+        return g.float().cumsum(dim=1) * RCP_LN2
+    if g.shape[0] != 1:
+        raise ValueError("reference varlen expects batch size 1")
+    boundaries = cu_seqlens.tolist()
+    return torch.cat([
+        g[:, a:b].float().cumsum(dim=1)
+        for a, b in zip(boundaries[:-1], boundaries[1:])
+    ], dim=1) * RCP_LN2
 
 
 def wall_attention_reference_torch(
@@ -28,14 +40,9 @@ def wall_attention_reference_torch(
     if q.shape[2] % k.shape[2] != 0:
         raise ValueError("HQ must be divisible by H (GQA)")
 
-    P = chunk_global_cumsum(g, cu_seqlens=cu_seqlens, scale=RCP_LN2)
+    P = _prefix(g, cu_seqlens)
     k_exp = k.repeat_interleave(G, dim=2)
     B, T, HQ, _K = q.shape
-    diff = P.unsqueeze(2).float() - P.unsqueeze(1).float()
-    scores = (
-        q.unsqueeze(2).float() * k_exp.unsqueeze(1).float() * torch.exp2(diff)
-    ).sum(-1).permute(0, 3, 1, 2).contiguous()
-
     i_idx = torch.arange(T, device=q.device, dtype=torch.long).view(1, T, 1)
     j_idx = torch.arange(T, device=q.device, dtype=torch.long).view(1, 1, T)
     valid = j_idx <= i_idx
@@ -53,11 +60,17 @@ def wall_attention_reference_torch(
         seg_j = seg.view(1, 1, T)
         valid = valid & (seg_i == seg_j)
 
+    diff = P.unsqueeze(2).float() - P.unsqueeze(1).float()
+    diff = diff.masked_fill(~valid[..., None, None], float("-inf"))
+    scores = (
+        q.unsqueeze(2).float() * k_exp.unsqueeze(1).float() * torch.exp2(diff)
+    ).sum(-1).permute(0, 3, 1, 2).contiguous()
+
     valid_hq = valid.unsqueeze(1).expand(B, HQ, T, T)
     scores = scores.masked_fill(~valid_hq, float("-inf")) * (scale * RCP_LN2)
 
     if g_scalar is not None:
-        c = chunk_global_cumsum(g_scalar, cu_seqlens=cu_seqlens, scale=RCP_LN2)
+        c = _prefix(g_scalar, cu_seqlens)
         c_hq = c.permute(0, 2, 1).float()
         scores = scores + c_hq.unsqueeze(-1) - c_hq.unsqueeze(-2)
 
@@ -70,7 +83,7 @@ def wall_attention_reference_torch(
         den = den + torch.exp2(sink_l2 - m_stable.squeeze(-1))
     w = p / den.unsqueeze(-1)
     v_h = v.repeat_interleave(G, dim=2).permute(0, 2, 1, 3).contiguous()
-    o = torch.matmul(w, v_h).transpose(1, 2).contiguous()
+    o = torch.matmul(w, v_h.float()).transpose(1, 2).contiguous()
     return o
 
 

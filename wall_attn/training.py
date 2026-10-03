@@ -110,7 +110,7 @@ def parallel_wall_attn_fwd_kernel(
     # b_R is at i_t*BT; the same value is used in both off-diag and diag loops,
     # since |b_pq - b_R| within a BT-chunk is bounded by BT*|g_max|*RCP_LN2.
     # Off-diagonal: P_q - R <= 0 and R - P_k <= 0 → exp2 <= 1 → bf16 safe.
-    b_q_til = (b_q.to(tl.float32) * exp2(b_pq - b_R)).to(b_q.dtype)
+    b_q_til = (b_q.to(tl.float32) * exp2(tl.where((i_t * BT + tl.arange(0, BT))[:, None] < T, b_pq - b_R, 0.0))).to(b_q.dtype)
 
     b_o = tl.zeros([BT, BV], dtype=tl.float32)
     b_m = tl.full([BT], float('-inf'), dtype=tl.float32)
@@ -138,7 +138,7 @@ def parallel_wall_attn_fwd_kernel(
         b_k = tl.load(p_k, boundary_check=(0, 1))
         b_v = tl.load(p_v, boundary_check=(0, 1))
         b_pk = tl.load(p_pk, boundary_check=(0, 1)).to(tl.float32)
-        b_k_til = (b_k.to(tl.float32) * exp2(b_R_t - b_pk)).to(b_k.dtype)
+        b_k_til = (b_k.to(tl.float32) * exp2(tl.where((i_s + tl.arange(0, BS))[None, :] < T, b_R_t - b_pk, 0.0))).to(b_k.dtype)
         b_s = tl.dot(b_q_til, b_k_til) * scale * RCP_LN2
 
         o_k = i_s + tl.arange(0, BS)
@@ -175,7 +175,7 @@ def parallel_wall_attn_fwd_kernel(
         b_pk = tl.load(p_pk, boundary_check=(0, 1)).to(tl.float32)
 
         # k_til in local frame: exp2 bounded by BS positions ≤ 110 (fp32-safe with BK dot).
-        b_exp_k = b_R_local_t - b_pk
+        b_exp_k = tl.where(m_k[None, :], b_R_local_t - b_pk, 0.0)
         b_exp_k = tl.where(b_exp_k > 110.0, tl.zeros_like(b_exp_k) + 110.0, b_exp_k)
         b_k_til = b_k.to(tl.float32) * exp2(b_exp_k)
 
@@ -298,7 +298,7 @@ def parallel_wall_attn_bwd_kernel_dq(
     b_pq = tl.load(p_pq, boundary_check=(0, 1)).to(tl.float32)
     b_R = tl.load(p_R, boundary_check=(0, 1)).to(tl.float32)
     # Off-diagonal q_til (bf16 tensor cores, exp2 <= 1).
-    b_q_til = (b_q.to(tl.float32) * exp2(b_pq - b_R)).to(b_q.dtype)
+    b_q_til = (b_q.to(tl.float32) * exp2(tl.where((i_t * BT + tl.arange(0, BT))[:, None] < T, b_pq - b_R, 0.0))).to(b_q.dtype)
 
     b_do = tl.load(p_do, boundary_check=(0, 1))
     b_lse = tl.load(p_lse, boundary_check=(0,))
@@ -325,7 +325,7 @@ def parallel_wall_attn_bwd_kernel_dq(
         b_k = tl.load(p_k, boundary_check=(0, 1))
         b_pk = tl.load(p_pk, boundary_check=(0, 1)).to(tl.float32)
         b_v = tl.load(p_v, boundary_check=(0, 1))
-        b_k_til = (b_k.to(tl.float32) * exp2(b_R_t - b_pk)).to(b_k.dtype)
+        b_k_til = (b_k.to(tl.float32) * exp2(tl.where((i_s + tl.arange(0, BS))[None, :] < T, b_R_t - b_pk, 0.0))).to(b_k.dtype)
         b_s = tl.dot(b_q_til, b_k_til) * scale * RCP_LN2
 
         if USE_SCALAR_G:
@@ -361,12 +361,12 @@ def parallel_wall_attn_bwd_kernel_dq(
         b_v = tl.load(p_v, boundary_check=(0, 1))
 
         # Local-ref k_til: exp2 arg bounded by BS positions ≤ 110 (fp32-safe with BK dot).
-        b_exp_k = b_R_local_t - b_pk
+        b_exp_k = tl.where(m_k[None, :], b_R_local_t - b_pk, 0.0)
         b_exp_k = tl.where(b_exp_k > 110.0, tl.zeros_like(b_exp_k) + 110.0, b_exp_k)
         b_k_til = b_k.to(tl.float32) * exp2(b_exp_k)
 
         # q_til in local frame for computing scores.
-        b_q_til_local = b_q.to(tl.float32) * exp2(b_pq - b_R_local_bc)
+        b_q_til_local = b_q.to(tl.float32) * exp2(tl.where((o_q < T)[:, None], b_pq - b_R_local_bc, 0.0))
         b_s = tl.dot(b_q_til_local, b_k_til) * scale * RCP_LN2
 
         if USE_SCALAR_G:
@@ -387,12 +387,12 @@ def parallel_wall_attn_bwd_kernel_dq(
         # For Q < sub-block start: causal mask makes ds=0, but mask explicitly to kill fp noise.
         b_dq_sub = tl.dot(b_ds.to(tl.float32), tl.trans(b_k_til))
         m_q_causal = (o_q >= i_s)[:, None]
-        b_dq_diag += tl.where(m_q_causal, b_dq_sub * exp2(b_pq - b_R_local_bc), 0.0)
+        b_dq_diag += tl.where(m_q_causal, b_dq_sub * exp2(tl.where((o_q < T)[:, None], b_pq - b_R_local_bc, 0.0)), 0.0)
         if USE_SCALAR_G:
             b_dc += tl.sum(b_ds, 1)
 
     # Off-diagonal (chunk-ref) + diagonal (direct output space).
-    b_dq = (b_dq_til * scale) * exp2(b_pq - b_R) + b_dq_diag * scale
+    b_dq = (b_dq_til * scale) * exp2(tl.where((i_t * BT + tl.arange(0, BT))[:, None] < T, b_pq - b_R, 0.0)) + b_dq_diag * scale
 
     # Structural: b_dg derived from b_dq (saves [BT,BK] fp32 accumulator).
     b_dg = LN2 * b_q.to(tl.float32) * b_dq
@@ -495,7 +495,7 @@ def parallel_wall_attn_bwd_kernel_dkv(
         b_Rq_bc_q = tl.broadcast_to(b_Rq, (BS, BK))
         b_q = tl.load(p_q, boundary_check=(0, 1))
         b_pq = tl.load(p_pq, boundary_check=(0, 1)).to(tl.float32)
-        b_exp_k = b_Rq_bc_k - b_pk
+        b_exp_k = tl.where((o_k < T)[:, None], b_Rq_bc_k - b_pk, 0.0)
         # Non-causal keys (key_pos > last query in sub-block) can have
         # exp_k >> 110, overflowing the gradient headroom.  The causal mask
         # zeros their contribution in b_p, but inf*0 = NaN poisons b_dk/b_dg.
@@ -503,13 +503,14 @@ def parallel_wall_attn_bwd_kernel_dkv(
         # in dg accumulation stay well within fp32.
         b_exp_k = tl.where(b_exp_k > 110.0, tl.zeros_like(b_exp_k) + 110.0, b_exp_k)
         b_exp_k_val = exp2(b_exp_k)  # CSE: reused for k_til and final dk scaling
+        # Zero padded exponents BEFORE exp2: 0 * exp2(-R) can be 0 * inf.
         if DIAG_BF16:
             # Fast path: bf16 tensor cores, fp32 accumulation.
-            b_q_til = (b_q.to(tl.float32) * exp2(b_pq - b_Rq_bc_q)).to(b_q.dtype)
+            b_q_til = (b_q.to(tl.float32) * exp2(tl.where(m_q[:, None], b_pq - b_Rq_bc_q, 0.0))).to(b_q.dtype)
             b_k_til = (b_k.to(tl.float32) * b_exp_k_val).to(b_k.dtype)
         else:
             # Precise path: fp32 tensor cores.
-            b_q_til = b_q.to(tl.float32) * exp2(b_pq - b_Rq_bc_q)
+            b_q_til = b_q.to(tl.float32) * exp2(tl.where(m_q[:, None], b_pq - b_Rq_bc_q, 0.0))
             b_k_til = b_k.to(tl.float32) * b_exp_k_val
         b_do = tl.load(p_do, boundary_check=(0, 1))
         b_lse = tl.load(p_lse, boundary_check=(0,))
@@ -553,8 +554,8 @@ def parallel_wall_attn_bwd_kernel_dkv(
         b_Rq_bc_q = tl.broadcast_to(b_Rq, (BS, BK))
         b_q = tl.load(p_q, boundary_check=(0, 1))
         b_pq = tl.load(p_pq, boundary_check=(0, 1)).to(tl.float32)
-        b_q_til = (b_q.to(tl.float32) * exp2(b_pq - b_Rq_bc_q)).to(b_q.dtype)
-        b_exp_k_off = b_Rq_bc_k - b_pk
+        b_q_til = (b_q.to(tl.float32) * exp2(tl.where(m_q[:, None], b_pq - b_Rq_bc_q, 0.0))).to(b_q.dtype)
+        b_exp_k_off = tl.where((o_k < T)[:, None], b_Rq_bc_k - b_pk, 0.0)
         b_exp_k_off_val = exp2(b_exp_k_off)  # CSE: reused for k_til and final dk scaling
         b_k_til = (b_k.to(tl.float32) * b_exp_k_off_val).to(b_k.dtype)
         b_do = tl.load(p_do, boundary_check=(0, 1))
@@ -974,7 +975,9 @@ def wall_attn(
         q: ``[B, T, HQ, K]`` queries.
         k: ``[B, T, H,  K]`` keys (``H`` may be < ``HQ`` for GQA).
         v: ``[B, T, H,  V]`` values.
-        g: ``[B, T, HQ, K]`` per-channel log-decay (will be cumsum'd internally).
+        g: ``[B, T, HQ, K]`` natural-log decay (cumsum and log2 conversion
+            happen internally). For bounded retention use
+            ``soft_clamp_log_gates(F.logsigmoid(logits.float()))`` first.
         g_scalar: optional ``[B, T, HQ]`` FoX-style additive scalar gate.
         sink_bias: optional ``[HQ]`` attention-sink logit.
         scale: softmax scale; defaults to ``K ** -0.5``.

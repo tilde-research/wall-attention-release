@@ -26,13 +26,14 @@ pip install -e .
 
 ```python
 import torch
-from wall_attn import wall_attn
+from wall_attn import wall_attn, soft_clamp_log_gates
 
 B, T, H, HQ, K, V = 2, 1024, 4, 8, 64, 64  # GQA: HQ query heads, H kv heads
 q = torch.randn(B, T, HQ, K, device="cuda", dtype=torch.bfloat16, requires_grad=True)
 k = torch.randn(B, T, H,  K, device="cuda", dtype=torch.bfloat16, requires_grad=True)
 v = torch.randn(B, T, H,  V, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-g = torch.randn(B, T, HQ, K, device="cuda", dtype=torch.bfloat16, requires_grad=True) * 0.02
+gate_logits = torch.randn(B, T, HQ, K, device="cuda", dtype=torch.float32, requires_grad=True)
+g = soft_clamp_log_gates(torch.nn.functional.logsigmoid(gate_logits), g_max=0.86)
 
 o = wall_attn(q, k, v, g, scale=K**-0.5)  # [B, T, HQ, V]
 o.sum().backward()
